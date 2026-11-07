@@ -1,4 +1,5 @@
 """Core decision engine: fast local path -> guard -> (cache) -> LLM -> sanitise -> log."""
+import re
 import time
 from dataclasses import dataclass
 
@@ -11,6 +12,34 @@ from .session import Session
 
 IDEMPOTENT = {"uname", "id", "ps", "ifconfig", "ip", "uptime", "df", "free", "w", "lscpu", "lsb_release", "hostnamectl"}
 
+_ERR = re.compile(r"(command not found|No such file or directory|Permission denied|cannot |File exists)")
+_META = re.compile(r"[|<>`$&]")
+
+
+def split_compound(cmd: str):
+    """Split on && || ; outside quotes. Returns [(segment, operator_that_follows)]."""
+    out, buf, quote, i = [], [], None, 0
+    while i < len(cmd):
+        ch = cmd[i]
+        if quote:
+            buf.append(ch)
+            if ch == quote:
+                quote = None
+        elif ch in "'\"":
+            quote = ch
+            buf.append(ch)
+        elif cmd.startswith("&&", i) or cmd.startswith("||", i):
+            out.append(("".join(buf).strip(), cmd[i:i + 2]))
+            buf, i = [], i + 1
+        elif ch == ";":
+            out.append(("".join(buf).strip(), ";"))
+            buf = []
+        else:
+            buf.append(ch)
+        i += 1
+    out.append(("".join(buf).strip(), ""))
+    return [(seg, op) for seg, op in out if seg]
+
 
 @dataclass
 class Result:
@@ -18,6 +47,7 @@ class Result:
     close: bool = False
     source: str = "llm"      # local | guard | cache | llm | fallback
     latency_ms: float = 0.0
+    ok: bool = True          # False when the command "failed" (drives && / || chaining)
 
 
 class HoneypotEngine:
@@ -43,7 +73,7 @@ class HoneypotEngine:
             if target in s.dirs:
                 s.cwd = target
                 return Result("", source="local")
-            return Result(f"bash: cd: {parts[1]}: No such file or directory", source="local")
+            return Result(f"bash: cd: {parts[1]}: No such file or directory", source="local", ok=False)
         if base == "mkdir":
             names = [p for p in parts[1:] if not p.startswith("-")]
             err = []
@@ -59,7 +89,7 @@ class HoneypotEngine:
                     for seg in [x for x in path.split("/") if x]:
                         cur += "/" + seg
                         s.dirs.add(cur)
-            return Result("\n".join(err), source="local")
+            return Result("\n".join(err), source="local", ok=not err)
         return None
 
     def _messages(self, s: Session, cmd: str):
@@ -71,8 +101,24 @@ class HoneypotEngine:
         return msgs
 
     async def handle(self, s: Session, raw: str) -> Result:
+        """Entry point. Handles command chaining (&&, ||, ;) then delegates each segment."""
+        segs = split_compound(raw.strip())
+        if len(segs) <= 1:
+            return await self._handle_one(s, segs[0][0] if segs else "")
+        outputs, last, prev_op = [], Result(""), ";"
+        for seg, op in segs:
+            run = (prev_op == ";" or (prev_op == "&&" and last.ok) or (prev_op == "||" and not last.ok))
+            if run:
+                last = await self._handle_one(s, seg)
+                if last.close:
+                    return last
+                if last.output:
+                    outputs.append(last.output)
+            prev_op = op
+        return Result("\n".join(outputs), source=last.source, ok=last.ok)
+
+    async def _handle_one(self, s: Session, cmd: str) -> Result:
         t0 = time.perf_counter()
-        cmd = raw.strip()
         if not cmd:
             return Result("", source="local")
         s.n_cmds += 1
@@ -81,9 +127,9 @@ class HoneypotEngine:
 
         if check_input(cmd):
             flags.append("prompt_injection_attempt")
-            res = Result(fallback_error(cmd), source="guard")
+            res = Result(fallback_error(cmd), source="guard", ok=False)
         else:
-            res = self._local(s, cmd)
+            res = None if _META.search(cmd) else self._local(s, cmd)
             if res is None:
                 key = cmd if (cmd.split()[0] in IDEMPOTENT or cmd.startswith(("cat /etc/", "cat /proc/"))) else None
                 if key and key in s.cache:
@@ -93,13 +139,13 @@ class HoneypotEngine:
                         raw_out = await self.backend.complete(build_system(self.cfg, s), self._messages(s, cmd), self.cfg.max_tokens)
                         out, f = sanitize_output(raw_out, cmd, self.cfg.max_output_lines)
                         flags += f
-                        res = Result(out, source="llm")
+                        res = Result(out, source="llm", ok=not _ERR.search(out))
                         if key and "leak_blocked" not in f:
                             s.cache[key] = out
                     except LLMError as e:
                         flags.append("llm_error")
                         self.log.write("llm_error", session=s.id, error=str(e)[:200])
-                        res = Result(fallback_error(cmd), source="fallback")
+                        res = Result(fallback_error(cmd), source="fallback", ok=False)
 
         res.latency_ms = round((time.perf_counter() - t0) * 1000, 1)
         s.history.append((cwd_before, cmd, res.output))

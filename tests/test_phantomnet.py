@@ -82,3 +82,24 @@ def test_attack_tagging():
     assert "T1105" in tag_techniques("wget http://x/y.sh")
     assert {"T1070.003", "T1222.002"} <= set(tag_techniques("chmod +x a; history -c"))
     assert tag_techniques("ls") == []
+
+
+def test_command_chaining(tmp_path):
+    from phantomnet.engine import split_compound
+    cfg, e = make(tmp_path)
+    s = sess(cfg)
+    assert run(e.handle(s, "mkdir test && cd test && pwd")).output == "/root/test"
+    assert s.cwd == "/root/test"
+    s2 = sess(cfg)
+    r = run(e.handle(s2, "cd /nope && pwd"))          # pwd must NOT run after a failed cd
+    assert "No such file" in r.output and "/root" not in r.output.replace("bash: cd: /nope", "")
+    assert run(e.handle(sess(cfg), "cd /nope || pwd")).output.endswith("/root")
+    assert run(e.handle(sess(cfg), "whoami; pwd")).output == "root\n/root"
+    assert split_compound('echo "a && b"') == [('echo "a && b"', "")]
+    assert [x[1] for x in split_compound("a && b || c ; d")] == ["&&", "||", ";", ""]
+
+
+def test_pipes_go_to_llm(tmp_path):
+    cfg, e = make(tmp_path)
+    r = run(e.handle(sess(cfg), "pwd | cat"))          # metachar -> not handled locally
+    assert r.source != "local"

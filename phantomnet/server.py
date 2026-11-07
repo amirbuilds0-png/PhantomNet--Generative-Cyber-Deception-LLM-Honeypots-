@@ -96,12 +96,21 @@ def main():
     cfg = load_config(args.config)
     logging.basicConfig(level=logging.INFO)
     loop = asyncio.new_event_loop()
-    loop.run_until_complete(start(cfg))
+    asyncio.set_event_loop(loop)
+    server = loop.run_until_complete(start(cfg))
     logging.info("PhantomNet listening on %s:%s (backend=%s)", cfg.host, cfg.port, cfg.backend)
     try:
         loop.run_forever()
     except KeyboardInterrupt:
-        pass
+        logging.info("Shutting down...")
+    finally:
+        server.close()
+        loop.run_until_complete(server.wait_closed())
+        pending = asyncio.all_tasks(loop)
+        for t in pending:
+            t.cancel()
+        loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+        loop.close()
 
 
 if __name__ == "__main__":
