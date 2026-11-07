@@ -1,0 +1,8 @@
+backend: mock
+commands: 19
+leak_rate: 0.0
+state_consistency: True
+idempotent_stable: True
+latency_p50_ms: 0.0
+latency_max_ms: 0.1
+local_or_cached_share: 0.37

@@ -1,0 +1,12 @@
+# PhantomNet configuration (env vars PHANTOMNET_<KEY> override these)
+host: 0.0.0.0
+port: 2222
+hostname: srv-db-02
+backend: mock            # mock | anthropic | openai   (openai = any OpenAI-compatible API, e.g. Ollama)
+model: claude-haiku-5-5  # for ollama use e.g. llama3.1:8b
+base_url: http://localhost:11434/v1
+accept_after_attempts: 2 # accept login on Nth password attempt (looks more realistic)
+history_window: 12
+max_output_lines: 60
+session_timeout: 300
+max_commands: 200
